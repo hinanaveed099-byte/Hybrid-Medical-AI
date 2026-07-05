@@ -45,6 +45,7 @@ def load_classifier_model():
 classifier_model = load_classifier_model()
 
 brain_model = load_first_model([
+    "models/best_brain_tumor_model.keras",
     "models/best_brain_tumor_MobileNetV2.keras",
     "models/brain_tumor_model.keras",
     "models/best_brain_tumor_EfficientNetB0.keras",

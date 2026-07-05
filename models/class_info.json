@@ -1,0 +1,31 @@
+{
+  "classes": [
+    "brain_mri",
+    "chest_xray",
+    "dental_xray",
+    "natural_image",
+    "retina_oct",
+    "skin_image"
+  ],
+  "class_indices": {
+    "brain_mri": 0,
+    "chest_xray": 1,
+    "dental_xray": 2,
+    "natural_image": 3,
+    "retina_oct": 4,
+    "skin_image": 5
+  },
+  "supported_classes": [
+    "brain_mri",
+    "chest_xray",
+    "retina_oct"
+  ],
+  "display_names": {
+    "brain_mri": "Brain MRI",
+    "chest_xray": "Chest X-ray",
+    "retina_oct": "Retina OCT",
+    "dental_xray": "Dental X-ray",
+    "skin_image": "Skin Image",
+    "natural_image": "Natural Image"
+  }
+}

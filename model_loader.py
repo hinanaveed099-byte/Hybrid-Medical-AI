@@ -43,21 +43,29 @@ def _patch_json_attrs(h5_file):
             continue
 
 
-def _load_patched_h5(model_path, compile=False):
+def _load_patched_h5(model_path, compile=False, custom_objects=None):
     fd, tmp_path = tempfile.mkstemp(suffix=".h5")
     os.close(fd)
     shutil.copy2(model_path, tmp_path)
 
+    load_kwargs = {}
+    if custom_objects:
+        load_kwargs["custom_objects"] = custom_objects
+
     try:
         with h5py.File(tmp_path, "r+") as h5_file:
             _patch_json_attrs(h5_file)
-        return load_model(tmp_path, compile=compile)
+        return load_model(tmp_path, compile=compile, **load_kwargs)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def _load_patched_keras(model_path, compile=False):
+def _load_patched_keras(model_path, compile=False, custom_objects=None):
+    load_kwargs = {}
+    if custom_objects:
+        load_kwargs["custom_objects"] = custom_objects
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         patched_path = os.path.join(tmp_dir, "patched_model.keras")
 
@@ -71,21 +79,24 @@ def _load_patched_keras(model_path, compile=False):
                         data = json.dumps(config).encode("utf-8")
                     zout.writestr(item, data)
 
-        return load_model(patched_path, compile=compile)
+        return load_model(patched_path, compile=compile, **load_kwargs)
 
 
-def load_compatible_model(model_path, compile=False):
+def load_compatible_model(model_path, compile=False, custom_objects=None):
     """Load .h5 or .keras model, patching Colab/local Keras version mismatch."""
+    load_kwargs = {}
+    if custom_objects:
+        load_kwargs["custom_objects"] = custom_objects
     try:
-        return load_model(model_path, compile=compile)
+        return load_model(model_path, compile=compile, **load_kwargs)
     except (TypeError, ValueError) as exc:
         if "quantization_config" not in str(exc):
             raise
 
     if model_path.endswith(".h5"):
-        return _load_patched_h5(model_path, compile=compile)
+        return _load_patched_h5(model_path, compile=compile, custom_objects=custom_objects)
     if model_path.endswith(".keras"):
-        return _load_patched_keras(model_path, compile=compile)
+        return _load_patched_keras(model_path, compile=compile, custom_objects=custom_objects)
 
     raise RuntimeError(f"Unsupported model format: {model_path}")
 

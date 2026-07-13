@@ -7,6 +7,8 @@ import cv2
 import os
 
 from model_loader import load_compatible_model
+from hvf_net.predict import load_hvf_model, verify_prediction
+from hvf_net.pipeline import disease_detected
 
 app = Flask(__name__)
 
@@ -65,6 +67,13 @@ eye_model = load_first_model([
     "models/final_eye_disease_EfficientNetB0.keras",
 ], "Eye")
 
+print("Loading HVF-Net supervisor...")
+hvf_model = load_hvf_model()
+if hvf_model is not None:
+    print("HVF-Net loaded: models/hvf_net_model.keras")
+else:
+    print("WARNING: HVF-Net model not found. API will run without verification.")
+
 # ======================
 # CLASSIFIER CLASSES (6-class)
 # ======================
@@ -97,6 +106,18 @@ else:
         "retina_oct",
         "skin_image",
     ]
+
+SPECIALIST_MODEL_NAMES = {
+    "brain_mri": "Brain Tumor AI Model",
+    "chest_xray": "Pneumonia AI Model",
+    "retina_oct": "Eye Disease AI Model",
+}
+
+SCAN_TYPE_NAMES = {
+    "brain_mri": "Brain MRI",
+    "chest_xray": "Chest X-ray",
+    "retina_oct": "Retina OCT",
+}
 
 # ======================
 # PREPROCESS FUNCTIONS
@@ -165,111 +186,259 @@ def classify_image_type(image_path):
     confidence = round(float(prediction[0][class_index]) * 100, 2)
     display_name = DISPLAY_NAMES.get(image_type, image_type.replace("_", " ").title())
 
-    return image_type, display_name, confidence
+    return image_type, display_name, confidence, prediction[0]
 
 
-def unsupported_response(display_name, classifier_confidence):
-    return jsonify({
+def specialist_features(image_type, score):
+    positive = 1.0 if disease_detected(image_type, score) else 0.0
+    if image_type == "retina_oct":
+        spec_conf = (1.0 - score) if positive else score
+    else:
+        spec_conf = score if positive else (1.0 - score)
+    return positive, spec_conf
+
+
+def build_diagnosis(image_type, score):
+    if image_type == "brain_mri":
+        if score > 0.5:
+            confidence = round(score * 100, 2)
+            return {
+                "result": "YES",
+                "diagnosis": "Brain Tumor",
+                "confidence": confidence,
+                "severity": get_severity(confidence),
+                "message": "Brain MRI detected. Brain tumor analysis completed.",
+            }
+        confidence = round((1 - score) * 100, 2)
+        return {
+            "result": "NO",
+            "diagnosis": "No Brain Tumor",
+            "confidence": confidence,
+            "severity": "Normal",
+            "message": "Brain MRI detected. No brain tumor signs were found.",
+        }
+
+    if image_type == "chest_xray":
+        if score > 0.5:
+            confidence = round(score * 100, 2)
+            return {
+                "result": "YES",
+                "diagnosis": "Pneumonia",
+                "confidence": confidence,
+                "severity": get_severity(confidence),
+                "message": "Chest X-ray detected. Pneumonia analysis completed.",
+            }
+        confidence = round((1 - score) * 100, 2)
+        return {
+            "result": "NO",
+            "diagnosis": "Normal Chest X-Ray",
+            "confidence": confidence,
+            "severity": "Normal",
+            "message": "Chest X-ray detected. No pneumonia signs were found.",
+        }
+
+    # retina_oct (inverted score: high = normal)
+    if score > 0.5:
+        confidence = round(score * 100, 2)
+        return {
+            "result": "NO",
+            "diagnosis": "Normal Retina",
+            "confidence": confidence,
+            "severity": "Normal",
+            "message": "Retina OCT detected. No eye disease signs were found.",
+        }
+    confidence = round((1 - score) * 100, 2)
+    return {
+        "result": "YES",
+        "diagnosis": "CNV Disease",
+        "confidence": confidence,
+        "severity": get_severity(confidence),
+        "message": "Retina OCT detected. Eye disease analysis completed.",
+    }
+
+
+def run_specialist_raw(image_type, image_path):
+    if image_type == "brain_mri":
+        score = float(brain_model.predict(preprocess_brain(image_path), verbose=0)[0][0])
+    elif image_type == "chest_xray":
+        score = float(pneumonia_model.predict(preprocess_pneumonia(image_path), verbose=0)[0][0])
+    elif image_type == "retina_oct":
+        score = float(eye_model.predict(preprocess_retina(image_path), verbose=0)[0][0])
+    else:
+        raise ValueError(f"Unsupported specialist route: {image_type}")
+    return score
+
+
+def build_specialist_response(image_type, score, classifier_confidence):
+    diagnosis = build_diagnosis(image_type, score)
+    return {
+        "success": True,
+        "supported": True,
+        "uploaded_scan_type": SCAN_TYPE_NAMES[image_type],
+        "classifier_confidence": f"{classifier_confidence}%",
+        "selected_model": SPECIALIST_MODEL_NAMES[image_type],
+        "result": diagnosis["result"],
+        "diagnosis": diagnosis["diagnosis"],
+        "confidence": f"{diagnosis['confidence']}%",
+        "severity": diagnosis["severity"],
+        "message": diagnosis["message"],
+        "route": image_type,
+        "raw_score": score,
+    }
+
+
+def pick_reroute_candidate(classifier_probs, current_route):
+    """Next-best supported class from classifier probabilities (excluding current)."""
+    ranked = sorted(
+        (
+            (classifier_classes[i], float(classifier_probs[i]))
+            for i in range(len(classifier_classes))
+            if classifier_classes[i] in SUPPORTED_CLASSES
+            and classifier_classes[i] != current_route
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return ranked[0][0] if ranked else None
+
+
+def apply_hvf_verification(
+    response_dict,
+    image_path,
+    image_type,
+    classifier_probs,
+    score,
+    allow_reroute=True,
+):
+    """Run HVF-Net and apply accept / reject / re-route to the API response."""
+    positive, spec_conf = specialist_features(image_type, score)
+
+    hvf = verify_prediction(
+        image_path=image_path,
+        classifier_probs=classifier_probs,
+        specialist_score=score,
+        specialist_confidence=spec_conf,
+        specialist_positive=positive,
+        predicted_route=image_type,
+    )
+    response_dict["hvf_net"] = hvf
+
+    if not hvf.get("available"):
+        response_dict["hvf_available"] = False
+        response_dict["verified"] = None
+        return response_dict
+
+    response_dict["hvf_available"] = True
+    response_dict["trust_score"] = hvf["trust_score"]
+    response_dict["hvf_action"] = hvf["action"]
+
+    action = hvf["action"]
+
+    if action == "accept":
+        response_dict["verified"] = True
+        response_dict["message"] = (
+            f"{response_dict['message']} HVF-Net verified this result "
+            f"(trust={hvf['trust_score']:.2f})."
+        )
+        return response_dict
+
+    if action == "reject":
+        response_dict["verified"] = False
+        response_dict["message"] = hvf["message"]
+        response_dict["warning"] = (
+            "HVF-Net rejected this prediction due to low trust. "
+            "Please consult a doctor and do not treat this as a final diagnosis."
+        )
+        return response_dict
+
+    # action == "re-route"
+    response_dict["verified"] = False
+    response_dict["rerouted"] = False
+
+    if not allow_reroute:
+        response_dict["message"] = (
+            "HVF-Net suggested re-routing, but no further alternate route was tried. "
+            + hvf["message"]
+        )
+        return response_dict
+
+    alternate = pick_reroute_candidate(classifier_probs, image_type)
+    if alternate is None:
+        response_dict["message"] = (
+            "HVF-Net detected a possible routing mismatch, but no alternate "
+            "supported route was available. " + hvf["message"]
+        )
+        return response_dict
+
+    print(f"HVF-Net re-route: {image_type} → {alternate}")
+    alt_score = run_specialist_raw(alternate, image_path)
+    alt_response = build_specialist_response(
+        alternate,
+        alt_score,
+        round(float(classifier_probs[classifier_classes.index(alternate)]) * 100, 2),
+    )
+    alt_response["original_route"] = image_type
+    alt_response["original_diagnosis"] = response_dict.get("diagnosis")
+    alt_response["rerouted"] = True
+    alt_response["reroute_from"] = SCAN_TYPE_NAMES.get(image_type, image_type)
+    alt_response["reroute_to"] = SCAN_TYPE_NAMES.get(alternate, alternate)
+    alt_response["classifier_confidence"] = response_dict["classifier_confidence"]
+
+    # Re-verify once after re-route (no nested re-route loops)
+    return apply_hvf_verification(
+        alt_response,
+        image_path,
+        alternate,
+        classifier_probs,
+        alt_score,
+        allow_reroute=False,
+    )
+
+
+def unsupported_response(display_name, classifier_confidence, image_path=None, classifier_probs=None):
+    payload = {
         "success": True,
         "supported": False,
         "detected_image_type": display_name,
         "classifier_confidence": f"{classifier_confidence}%",
         "supported_scan_types": list(SUPPORTED_SCAN_TYPES),
         "message": UNSUPPORTED_MESSAGE_TEMPLATE.format(image_type=display_name),
-    }), 200
+    }
+
+    # Optional HVF check for unsupported images (route = none)
+    if image_path is not None and classifier_probs is not None and hvf_model is not None:
+        hvf = verify_prediction(
+            image_path=image_path,
+            classifier_probs=classifier_probs,
+            specialist_score=0.0,
+            specialist_confidence=0.0,
+            specialist_positive=0.0,
+            predicted_route="none",
+        )
+        payload["hvf_net"] = hvf
+        payload["hvf_available"] = bool(hvf.get("available"))
+        if hvf.get("available"):
+            payload["trust_score"] = hvf["trust_score"]
+            payload["hvf_action"] = hvf["action"]
+
+    return jsonify(payload), 200
 
 
-def run_brain_model(image_path, classifier_confidence):
-    img = preprocess_brain(image_path)
-    score = float(brain_model.predict(img, verbose=0)[0][0])
-
-    if score > 0.5:
-        diagnosis = "Brain Tumor"
-        confidence = round(score * 100, 2)
-        severity = get_severity(confidence)
-        answer = "YES"
-        message = "Brain MRI detected. Brain tumor analysis completed."
-    else:
-        diagnosis = "No Brain Tumor"
-        confidence = round((1 - score) * 100, 2)
-        severity = "Normal"
-        answer = "NO"
-        message = "Brain MRI detected. No brain tumor signs were found."
-
-    return jsonify({
-        "success": True,
-        "supported": True,
-        "uploaded_scan_type": "Brain MRI",
-        "classifier_confidence": f"{classifier_confidence}%",
-        "selected_model": "Brain Tumor AI Model",
-        "result": answer,
-        "diagnosis": diagnosis,
-        "confidence": f"{confidence}%",
-        "severity": severity,
-        "message": message,
-    })
-
-
-def run_pneumonia_model(image_path, classifier_confidence):
-    img = preprocess_pneumonia(image_path)
-    score = float(pneumonia_model.predict(img, verbose=0)[0][0])
-
-    if score > 0.5:
-        diagnosis = "Pneumonia"
-        confidence = round(score * 100, 2)
-        severity = get_severity(confidence)
-        answer = "YES"
-        message = "Chest X-ray detected. Pneumonia analysis completed."
-    else:
-        diagnosis = "Normal Chest X-Ray"
-        confidence = round((1 - score) * 100, 2)
-        severity = "Normal"
-        answer = "NO"
-        message = "Chest X-ray detected. No pneumonia signs were found."
-
-    return jsonify({
-        "success": True,
-        "supported": True,
-        "uploaded_scan_type": "Chest X-ray",
-        "classifier_confidence": f"{classifier_confidence}%",
-        "selected_model": "Pneumonia AI Model",
-        "result": answer,
-        "diagnosis": diagnosis,
-        "confidence": f"{confidence}%",
-        "severity": severity,
-        "message": message,
-    })
-
-
-def run_eye_model(image_path, classifier_confidence):
-    img = preprocess_retina(image_path)
-    score = float(eye_model.predict(img, verbose=0)[0][0])
-
-    if score > 0.5:
-        diagnosis = "Normal Retina"
-        confidence = round(score * 100, 2)
-        severity = "Normal"
-        answer = "NO"
-        message = "Retina OCT detected. No eye disease signs were found."
-    else:
-        diagnosis = "CNV Disease"
-        confidence = round((1 - score) * 100, 2)
-        severity = get_severity(confidence)
-        answer = "YES"
-        message = "Retina OCT detected. Eye disease analysis completed."
-
-    return jsonify({
-        "success": True,
-        "supported": True,
-        "uploaded_scan_type": "Retina OCT",
-        "classifier_confidence": f"{classifier_confidence}%",
-        "selected_model": "Eye Disease AI Model",
-        "result": answer,
-        "diagnosis": diagnosis,
-        "confidence": f"{confidence}%",
-        "severity": severity,
-        "message": message,
-    })
+def run_with_hvf(image_type, image_path, classifier_confidence, classifier_probs):
+    score = run_specialist_raw(image_type, image_path)
+    response = build_specialist_response(image_type, score, classifier_confidence)
+    response = apply_hvf_verification(
+        response,
+        image_path,
+        image_type,
+        classifier_probs,
+        score,
+        allow_reroute=True,
+    )
+    # Internal fields — keep API clean for clients that only need clinical fields
+    response.pop("raw_score", None)
+    response.pop("route", None)
+    return jsonify(response)
 
 
 # ======================
@@ -284,9 +453,18 @@ def home():
         "endpoint": "/hybrid-predict",
         "method": "POST",
         "supported_scan_types": list(SUPPORTED_SCAN_TYPES),
+        "models": {
+            "classifier": True,
+            "brain": True,
+            "pneumonia": True,
+            "eye": True,
+            "hvf_net": hvf_model is not None,
+        },
+        "hvf_net": hvf_model is not None,
         "message": (
             "Upload an image to /hybrid-predict. "
-            "Supported types: Brain MRI, Chest X-ray, and Retina OCT."
+            "Supported types: Brain MRI, Chest X-ray, and Retina OCT. "
+            "HVF-Net verifies each diagnosis (accept / reject / re-route)."
         ),
     })
 
@@ -310,19 +488,23 @@ def hybrid_predict():
     file.save(image_path)
 
     try:
-        image_type, display_name, classifier_confidence = classify_image_type(image_path)
+        image_type, display_name, classifier_confidence, classifier_probs = classify_image_type(image_path)
 
         if image_type not in SUPPORTED_CLASSES:
-            return unsupported_response(display_name, classifier_confidence)
+            return unsupported_response(
+                display_name,
+                classifier_confidence,
+                image_path=image_path,
+                classifier_probs=classifier_probs,
+            )
 
-        if image_type == "brain_mri":
-            return run_brain_model(image_path, classifier_confidence)
-
-        if image_type == "chest_xray":
-            return run_pneumonia_model(image_path, classifier_confidence)
-
-        if image_type == "retina_oct":
-            return run_eye_model(image_path, classifier_confidence)
+        if image_type in SUPPORTED_CLASSES:
+            return run_with_hvf(
+                image_type,
+                image_path,
+                classifier_confidence,
+                classifier_probs,
+            )
 
         return jsonify({
             "success": False,
